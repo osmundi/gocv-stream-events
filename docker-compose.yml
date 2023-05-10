@@ -1,0 +1,44 @@
+version: "2.2"
+services:
+  app:
+    build: .
+    image: detector:latest
+    env_file:
+      - prod.env
+    working_dir: /go/src
+    volumes:
+      - ./container.log:/go/src/container.log
+    depends_on:
+      db:
+        condition:
+          service_healthy
+    # use bridge network and links on production server (because connections to camera stream from within dockerized app not working while using VPN)
+    # network_mode: "host"
+    links:
+      - db
+    command:
+      [
+        "/go/bin/app",
+        "--",
+        "yolo-obj_final.weights",
+        "yolo-obj.cfg",
+        "opencv",
+        "75",
+      ]
+  db:
+    image: postgres:latest
+    environment:
+      - POSTGRES_DB=seili_osprey_nest
+      - POSTGRES_USER=seili
+      - POSTGRES_PASSWORD=seilipassword
+      # optional default db
+      #POSTGRES_DB: "db"
+      #POSTGRES_HOST_AUTH_METHOD: "trust"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seili -d seili_osprey_nest"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
