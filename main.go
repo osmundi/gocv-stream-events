@@ -29,6 +29,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -284,50 +285,41 @@ func main() {
 	db = Database{pool}
 
 	// read command line arguments
-	if len(os.Args) < 4 {
-		fmt.Println("How to run:\ndnn-detection [videosource] [modelfile] [configfile] ([backend] [confidence])")
-		return
-	}
+	flag.StringVar(&model, "m", "yolo-obj_final.weights", "Object detection model")
+	flag.StringVar(&config, "c", "yolo-obj.cfg", "Object detection model configurations")
+	confidence := flag.Int("confidence", 75, "How certain the model must be of detected objects in order to notice them")
+	selectedBackend := flag.String("backend", "opencv", "Detection nets backend (opencv/openvino)")
+	targetString := flag.String("target", "cpu", "Will the model be run on CPU or GPU (check gocv.ParseNetTarget for possible targets")
+	deviceIds := flag.String("d", "--", "List of devices seperated by comma")
 
-	deviceIds := os.Args[1]
-	model = os.Args[2]
-	config = os.Args[3]
+	flag.Parse()
 
-	var deviceIdList []string
-	if deviceIds == "--" {
-		deviceIdList = db.getStreamAddress()
-
+	if *confidence <= 100 && *confidence > 0 {
+		confidenceTreshold = float32(*confidence) / 100
 	} else {
-		deviceIdList = strings.Split(deviceIds, ",")
-	}
-
-	backend = gocv.NetBackendDefault
-	if len(os.Args) > 4 {
-		backend = gocv.ParseNetBackend(os.Args[4])
-	}
-
-	var confPercents string
-	if len(os.Args) > 5 {
-		confPercents, atoiErr := strconv.Atoi(os.Args[5])
-		if atoiErr != nil {
-			log.Fatal(atoiErr)
-		}
-		if confPercents < 0 || confPercents > 1 {
-			fmt.Println("Confidence set to default (0.3) because provided input is too big or too low (use something between 0..1)")
-			confidenceTreshold = 0.3
-		}
-		confidenceTreshold = float32(confPercents) / 100
-	} else {
+		fmt.Println("Confidence set to default (0.3) because provided input is too big or too low (use something between 0..1)")
 		confidenceTreshold = 0.3
 	}
 
-	logConfigurations(map[string]string{"devices": deviceIds, "model": model, "config": config, "backend": os.Args[4], "confidence": confPercents})
-	/*
-	   // We'll do everything on CPU for now
-	   if len(os.Args) > 5 {
-	       target = gocv.ParseNetTarget(os.Args[5])
-	   }
-	*/
+    // serialize command line arguments
+	backend = gocv.ParseNetBackend(*selectedBackend)
+	if backend == gocv.NetBackendOpenVINO {
+		// vpu available on 13th gen intel cpus
+		target = gocv.NetTargetVPU
+		target = gocv.NetTargetCPU
+	}
+
+	target = gocv.ParseNetTarget(*targetString)
+
+	var deviceIdList []string
+	if *deviceIds == "--" {
+		deviceIdList = db.getStreamAddress()
+
+	} else {
+		deviceIdList = strings.Split(*deviceIds, ",")
+	}
+
+	logConfigurations(map[string]string{"devices": *deviceIds, "model": model, "config": config, "backend": *selectedBackend, "confidence": strconv.Itoa(*confidence)})
 
 	// its possible to read from multiple streams with this same program
 	var wg = &sync.WaitGroup{}
@@ -381,6 +373,7 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 
 	// open DNN object tracking model
 	net := gocv.ReadNet(model, config)
+
 	if net.Empty() {
 		fmt.Printf("Error reading network model from : %v %v\n", model, config)
 		return
@@ -396,14 +389,14 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 
 	for {
 		if sourceType == STREAM || sourceType == VIDEO {
-			// set 0-based index of the frame to be decoded/captured next.
 			if sourceType == STREAM {
+				// set 0-based index of the frame to be decoded/captured next.
+				// -> this will capture the most recent image
+                // Test waiting: ttime.Sleep(8 * time.Second)
 				webcam.Set(1, 0)
 			} else if sourceType == VIDEO {
 				webcam.Grab(25)
 			}
-			// read for webcam
-			fmt.Println(webcam)
 			if ok := webcam.Read(&img); !ok {
 				log.Printf("Device closed: %v\n", deviceID)
 				wg.Done()
@@ -476,12 +469,6 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 	}
 }
 
-// performDetection analyzes the results from the detector network,
-// which produces an output blob with a shape 1x1xNx7
-// where N is the number of detections, and each detection
-// is a vector of float values
-// [batchId, classId, confidence, left, top, right, bottom]
-
 func bbIntersectionOverUnion(a, b detectedObject) float64 {
 
 	boxA := []int{a.left, a.top, a.left + a.width, a.top + a.height}
@@ -506,6 +493,11 @@ func bbIntersectionOverUnion(a, b detectedObject) float64 {
 	return iou
 }
 
+// performDetection analyzes the results from the detector network,
+// which produces an output blob with a shape 1x1xNx7
+// where N is the number of detections, and each detection
+// is a vector of float values
+// [batchId, classId, confidence, left, top, right, bottom]
 func performDetection(frame *gocv.Mat, results []gocv.Mat) []detectedObject {
 
 	detectedObjects := []detectedObject{}
@@ -517,14 +509,18 @@ func performDetection(frame *gocv.Mat, results []gocv.Mat) []detectedObject {
 			log.Println("no data")
 		}
 
+		if output.Cols() < 0 {
+			row := data[0:10]
+			fmt.Println(row)
+			break
+		}
+
 		for j := 0; j < output.Total(); j += output.Cols() {
 			row := data[j : j+output.Cols()]
 			scores := row[5:]
 			classID, confidence := getClassIDAndConfidence(scores)
 
 			if confidence > confidenceTreshold {
-				log.Printf("Detected class:%s with %d%% confidence", classes[classID], int(confidence*100))
-
 				centerX := int(row[0] * float32(frame.Cols()))
 				centerY := int(row[1] * float32(frame.Rows()))
 				width := int(row[2] * float32(frame.Cols()))
@@ -540,6 +536,7 @@ func performDetection(frame *gocv.Mat, results []gocv.Mat) []detectedObject {
 				}
 
 				if len(detectedObjects) == 0 {
+					log.Printf("Detected class:%s with %d%% confidence", classes[classID], int(confidence*99))
 					detectedObjects = append(detectedObjects, currentlyDetectedObject)
 					continue
 				}
