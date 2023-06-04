@@ -27,15 +27,12 @@
 package main
 
 import (
-	"bufio"
-	"database/sql"
 	"flag"
 	"fmt"
 	"image"
 	"image/color"
 	"log"
 	"math"
-	"net/smtp"
 	"os"
 	"strconv"
 	"strings"
@@ -47,11 +44,19 @@ import (
 	"gocv.io/x/gocv"
 )
 
-var db Database
+var model string
+var config string
+var backend gocv.NetBackendType
+var target = gocv.NetTargetCPU
 
-var blue = color.RGBA{0, 0, 255, 0}
-var yellow = color.RGBA{0, 255, 0, 0}
+// coco.names
+var classes []string
 
+// global database connection pool
+var db *Database
+
+// the threshold where the recognitions will be taken into consideration
+// use high enough value (e.g. over 0.95) in order to avoid false positives
 var confidenceTreshold float32
 
 // this value controls overlapping bounding boxes
@@ -59,204 +64,12 @@ var confidenceTreshold float32
 // but dont draw duplicate bounding box from the same object
 var intersectionTreshold = 0.7
 
-var model string
-var config string
-var backend gocv.NetBackendType
-var target = gocv.NetTargetCPU
+var blue = color.RGBA{0, 0, 255, 0}
+var yellow = color.RGBA{0, 255, 0, 0}
 
-var classes = readClasses()
+var logfile *os.File
 
-var numberTranslator = map[int]string{1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five"}
-
-//go:generate go run golang.org/x/tools/cmd/stringer -type=deviceSource
-type deviceSource int
-
-const (
-	IMAGE deviceSource = iota
-	VIDEO
-	STREAM
-)
-
-var sourceType deviceSource
-
-type detectedObject struct {
-	confidence               float32
-	top, left, width, height int
-	label                    string
-}
-
-func logConfigurations(configs map[string]string) {
-	for k, v := range configs {
-		log.Println(k, "-", v)
-	}
-}
-
-func readClasses() []string {
-	var classes []string
-	file, err := os.Open("./coco.names")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		classes = append(classes, scanner.Text())
-	}
-
-	return classes
-}
-
-func sendMail(receiver string, title string, body string) {
-	from := os.Getenv("EMAIL_ADDR")
-	to := []string{receiver}
-	smtpHost := os.Getenv("SMTP_HOST")
-	message := []byte("Subject: " + title + "\r\n\r\n" + body + "\r\n")
-	err := smtp.SendMail(smtpHost+":25", nil, from, to, message)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Email notification of detected object has been sent to: %s", receiver)
-}
-
-type Database struct {
-	pool *sql.DB
-}
-
-func (db Database) getClassId(label string) (int, error) {
-	var class_id int
-	err := db.pool.QueryRow("SELECT class_id FROM classes WHERE label=$1", label).Scan(&class_id)
-	switch {
-	case err == sql.ErrNoRows:
-		log.Fatalf("no class with label %s\n", label)
-		return 0, err
-	case err != nil:
-		log.Fatalf("query error: %v\n", err)
-		return 0, err
-	default:
-		return class_id, nil
-	}
-}
-
-func (db Database) insertDetections(detectedObjects []detectedObject, classId int, captureTime string) (int, error) {
-	var lastInsertId int
-	err := db.pool.QueryRow("INSERT INTO detection_event(class, count, created) values($1, $2, $3) RETURNING id", classId, len(detectedObjects), captureTime).Scan(&lastInsertId)
-	if err != nil {
-		return 0, err
-	}
-
-	for _, obj := range detectedObjects {
-		_, err := db.pool.Exec("INSERT INTO detection(confidence, location_top, location_left, width, height, event) VALUES($1,$2,$3,$4,$5,$6)",
-			int(obj.confidence*100), obj.top, obj.left, obj.width, obj.height, lastInsertId)
-		if err != nil {
-			return 0, err
-		}
-	}
-
-	return lastInsertId, nil
-}
-
-func (db Database) hasBeenAlerted(email string, event int) bool {
-	var alertInterval string
-	var subscriptionId int
-	var intervalType string
-	var intervalLength int
-	err := db.pool.QueryRow("SELECT id, alert_interval FROM subscription WHERE observer_id=(SELECT id from observer WHERE email=$1)", email).Scan(&subscriptionId, &alertInterval)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Sscanf(alertInterval, "%d%s", &intervalLength, &intervalType)
-
-	loc, _ := time.LoadLocation("Europe/Helsinki")
-	captureTime := time.Now().In(loc)
-
-	var lastCapture string
-	_ = db.pool.QueryRow("SELECT created FROM alert WHERE subscription_id=$1 ORDER BY created DESC", subscriptionId).Scan(&lastCapture)
-
-	if len(lastCapture) > 0 {
-		lastCaptureTime, timeParsingError := time.ParseInLocation("2006-01-02T15:04:05Z", lastCapture, loc)
-		if timeParsingError != nil {
-			log.Fatal(timeParsingError)
-		}
-
-		switch {
-		case intervalType == "m":
-			if lastCaptureTime.After(captureTime.Add(-(time.Minute * time.Duration(intervalLength)))) {
-				return true
-			}
-		case intervalType == "h":
-			if lastCaptureTime.After(captureTime.Add(-(time.Hour * time.Duration(intervalLength)))) {
-				return true
-			}
-		case intervalType == "d":
-			if lastCaptureTime.After(captureTime.AddDate(0, 0, -intervalLength)) {
-				return true
-			}
-		default:
-			return true
-		}
-	}
-
-	_, err = db.pool.Exec("INSERT INTO alert (detection_event_id, subscription_id, created) VALUES ($1,$2,$3 )", event, subscriptionId, captureTime)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return false
-
-}
-
-func (db Database) notifyObservers(deviceID string, event int) {
-	rows, err := db.pool.Query("SELECT email FROM observer WHERE id IN (SELECT observer_id FROM subscription WHERE stream_id=(SELECT id FROM stream WHERE address=$1) AND alert=TRUE);", deviceID)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var email string
-		if err := rows.Scan(&email); err != nil {
-			log.Fatal(err)
-		}
-
-		if !db.hasBeenAlerted(email, event) {
-			var classId, count int
-			var stream, link string
-			_ = db.pool.QueryRow("SELECT name,link FROM stream WHERE address=$1", deviceID).Scan(&stream, &link)
-			err = db.pool.QueryRow("SELECT class,count FROM detection_event WHERE id=$1", event).Scan(&classId, &count)
-			if err != nil {
-				log.Fatal(err)
-			}
-			body := fmt.Sprintf("%s %s's detected at the stream of %s\n\nCheck stream at: %s\n\n***You are receiving this automatic notification because you have subscribed to the observer list of said stream***\n\nBr,\nBird detector agent", numberTranslator[count], classes[classId-1], stream, link)
-			log.Println(body)
-			sendMail(email, fmt.Sprintf("Detected object in: %s", stream), body)
-		}
-	}
-}
-
-func (db Database) getStreamAddress() []string {
-	var streams []string
-	var addr string
-	rows, err := db.pool.Query("SELECT address FROM stream")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		if err := rows.Scan(&addr); err != nil {
-			log.Fatal(err)
-		}
-
-		if addr != "" {
-			streams = append(streams, addr)
-		}
-
-	}
-	return streams
-}
-
-func main() {
+func init() {
 	// get environment variables
 	err := godotenv.Load(".env")
 	if err != nil {
@@ -264,25 +77,33 @@ func main() {
 	}
 
 	// setup logging
-	logfile, err := os.Create(os.Getenv("LOG_FILE"))
+	logfile, err = os.Create(os.Getenv("LOG_FILE"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer logfile.Close()
 	log.SetOutput(logfile)
 
 	// init database connection
 	psqlconn := fmt.Sprintf("host=%s port=%d user=%s "+
 		"password=%s dbname=%s sslmode=disable",
 		os.Getenv("DB_HOST"), 5432, os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_NAME"))
-	pool, _ := sql.Open("postgres", psqlconn)
-	pingErr := pool.Ping()
-	if pingErr != nil {
-		log.Fatalf("Cannot connect to database %v", pingErr)
-	}
-	defer pool.Close()
 
-	db = Database{pool}
+	db, err = NewDatabaseConnection(psqlconn)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func init() {
+	// initialize detectable classes to a variable
+	classes = readClasses()
+}
+
+func main() {
+
+	defer db.pool.Close()
+	defer logfile.Close()
 
 	// read command line arguments
 	flag.StringVar(&model, "m", "yolo-obj_final.weights", "Object detection model")
@@ -297,11 +118,11 @@ func main() {
 	if *confidence <= 100 && *confidence > 0 {
 		confidenceTreshold = float32(*confidence) / 100
 	} else {
-		fmt.Println("Confidence set to default (0.3) because provided input is too big or too low (use something between 0..1)")
-		confidenceTreshold = 0.3
+		fmt.Println("Confidence set to default (0.75) because provided input is too big or too low (use something between 0..100)")
+		confidenceTreshold = 0.75
 	}
 
-    // serialize command line arguments
+	// serialize command line arguments
 	backend = gocv.ParseNetBackend(*selectedBackend)
 	if backend == gocv.NetBackendOpenVINO {
 		// vpu available on 13th gen intel cpus
@@ -314,44 +135,44 @@ func main() {
 	var deviceIdList []string
 	if *deviceIds == "--" {
 		deviceIdList = db.getStreamAddress()
-
 	} else {
 		deviceIdList = strings.Split(*deviceIds, ",")
 	}
 
+	log.Println("*** run main ***")
 	logConfigurations(map[string]string{"devices": *deviceIds, "model": model, "config": config, "backend": *selectedBackend, "confidence": strconv.Itoa(*confidence)})
+	defer log.Println("*** end run ***")
 
 	// its possible to read from multiple streams with this same program
 	var wg = &sync.WaitGroup{}
 	for i, deviceID := range deviceIdList {
 		wg.Add(1)
-		go detectFromCapture(deviceID, i, wg)
+
+		sourceType := getDeviceType(deviceID)
+		if sourceType < 0 {
+			log.Printf("Unrecognized device: %s", deviceID)
+			continue
+		}
+
+		go detectFromCapture(sourceType, deviceID, i, wg)
 	}
 	wg.Wait()
 }
 
-func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
+func detectFromCapture(sourceType deviceSource, deviceID string, captureId int, wg *sync.WaitGroup) {
 
 	var webcam *gocv.VideoCapture
 	var captureError error
-
-	var window *gocv.Window
-	if os.Getenv("RUN_ENV") != "prod" {
-		window = gocv.NewWindow(fmt.Sprintf("DNN Detection - %d", captureId))
-		defer window.Close()
-	}
-
 	img := gocv.NewMat()
 	defer img.Close()
 
-	if strings.HasSuffix(deviceID, ".jpg") || strings.HasSuffix(deviceID, ".png") {
+	if sourceType == IMAGE {
 		img = gocv.IMRead(deviceID, gocv.IMReadColor)
 		if img.Empty() {
 			fmt.Printf("Error reading image from: %v\n", deviceID)
 			return
 		}
-		sourceType = IMAGE
-	} else if strings.HasSuffix(deviceID, ".mp4") || deviceID == "0" {
+	} else if sourceType == VIDEO {
 		// read from local video or webcam
 		webcam, captureError = gocv.OpenVideoCapture(deviceID)
 		if captureError != nil {
@@ -359,8 +180,7 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 			return
 		}
 		defer webcam.Close()
-		sourceType = VIDEO
-	} else if strings.HasPrefix(deviceID, "rtsp") {
+	} else if sourceType == STREAM {
 		// open capture device (with ffmpeg)
 		webcam, captureError = gocv.OpenVideoCaptureWithAPI(deviceID, 1900)
 		if captureError != nil {
@@ -368,7 +188,6 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 			return
 		}
 		defer webcam.Close()
-		sourceType = STREAM
 	}
 
 	// open DNN object tracking model
@@ -388,11 +207,12 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 	log.Printf("Start reading device (%v): %v\n", sourceType, deviceID)
 
 	for {
+        // capture image from video/stream
 		if sourceType == STREAM || sourceType == VIDEO {
 			if sourceType == STREAM {
 				// set 0-based index of the frame to be decoded/captured next.
 				// -> this will capture the most recent image
-                // Test waiting: ttime.Sleep(8 * time.Second)
+				// Test waiting: ttime.Sleep(8 * time.Second)
 				webcam.Set(1, 0)
 			} else if sourceType == VIDEO {
 				webcam.Grab(25)
@@ -430,8 +250,8 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 
 		detectedObjects := performDetection(&img, prob)
 
-		// TODO: run headless in production (no need to draw rectangles to image and show it in window)
 		if os.Getenv("RUN_ENV") == "prod" {
+            // save detections to database in production environment
 			if len(detectedObjects) == 0 {
 				continue
 			}
@@ -450,12 +270,9 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 			}
 		} else {
 			// show bounding box in own window when in test environment
-			for _, obj := range detectedObjects {
-				gocv.Rectangle(&img, image.Rect(obj.left, obj.top, obj.left+obj.width, obj.top+obj.height), yellow, 2)
-				gocv.PutText(&img, obj.label, image.Pt(obj.left, obj.top), gocv.FontHersheyPlain, 2.2, blue, 2)
-			}
-			window.ResizeWindow(1200, 720)
-			window.IMShow(img)
+			window := gocv.NewWindow(fmt.Sprintf("DNN Detection - %d", captureId))
+			defer window.Close()
+			drawBoundingBoxes(img, detectedObjects, window)
 			if window.WaitKey(1) >= 0 {
 				wg.Done()
 				break
@@ -467,6 +284,15 @@ func detectFromCapture(deviceID string, captureId int, wg *sync.WaitGroup) {
 		}
 		blob.Close()
 	}
+}
+
+func drawBoundingBoxes(img gocv.Mat, detectedObjects []detectedObject, window *gocv.Window) {
+	for _, obj := range detectedObjects {
+		gocv.Rectangle(&img, image.Rect(obj.left, obj.top, obj.left+obj.width, obj.top+obj.height), yellow, 2)
+		gocv.PutText(&img, obj.label, image.Pt(obj.left, obj.top), gocv.FontHersheyPlain, 2.2, blue, 2)
+	}
+	window.ResizeWindow(1200, 720)
+	window.IMShow(img)
 }
 
 func bbIntersectionOverUnion(a, b detectedObject) float64 {
