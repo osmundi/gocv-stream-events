@@ -16,5 +16,5 @@ COPY . .
 
 RUN go build -o /go/bin/app
 
-CMD ["/go/bin/app", "-d", "testi.mp4", "-m", "yolo-obj_final.weights", "-c", "yolo-obj.cfg"]
+CMD ["/go/bin/app", "-d", "0", "-m", "yolo-obj_final.weights", "-c", "yolo-obj.cfg"]
 

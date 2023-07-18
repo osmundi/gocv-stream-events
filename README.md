@@ -12,20 +12,19 @@ A [YOLO](https://pjreddie.com/darknet/yolo/) model (configuration and weights) i
 
 ### Build
 
-####CLI
-1. Initialize database with init.sql
-2. Set .env based on template.env and the database credentials just created with init.sql
+#### CLI
+1. Initialize postgresql database with init.sql
+2. Set .env based on template.env and the database credentials you just created 
 3. Build with `go build`
 
-
 #### Docker
+1. Build the application
 ```
 docker build -t detector:latest .
 ```
-
-Create docker.env based on template.env
-
-Create mounting points for database and logs:
+2. Create docker.env based on template.env
+3. Set up database credentials to the init.sql (set the same credentials to docker-compose.yml also)
+4. Create mounting points for database and logs:
 ```
 touch container.log
 mkdir dbdata
