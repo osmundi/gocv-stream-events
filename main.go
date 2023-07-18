@@ -38,6 +38,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"context"
 
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -52,7 +53,7 @@ var target = gocv.NetTargetCPU
 // coco.names
 var classes []string
 
-// global database connection pool
+// global database connection pool for ease of development
 var db *Database
 
 // the threshold where the recognitions will be taken into consideration
@@ -106,8 +107,8 @@ func main() {
 	defer logfile.Close()
 
 	// read command line arguments
-	flag.StringVar(&model, "m", "yolo-obj_final.weights", "Object detection model")
-	flag.StringVar(&config, "c", "yolo-obj.cfg", "Object detection model configurations")
+	flag.StringVar(&model, "m", "models/default/yolov4.weights", "Object detection model")
+	flag.StringVar(&config, "c", "models/default/yolov4-custom.cfg", "Object detection model configurations")
 	confidence := flag.Int("confidence", 75, "How certain the model must be of detected objects in order to notice them")
 	selectedBackend := flag.String("backend", "opencv", "Detection nets backend (opencv/openvino)")
 	targetString := flag.String("target", "cpu", "Will the model be run on CPU or GPU (check gocv.ParseNetTarget for possible targets")
@@ -182,11 +183,32 @@ func detectFromCapture(sourceType deviceSource, deviceID string, captureId int, 
 		defer webcam.Close()
 	} else if sourceType == STREAM {
 		// open capture device (with ffmpeg)
-		webcam, captureError = gocv.OpenVideoCaptureWithAPI(deviceID, 1900)
-		if captureError != nil {
-			fmt.Printf("Error opening video stream device: %v\n", deviceID)
-			return
+
+		// Create timeout of 5 seconds
+		ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+
+		c1 := make(chan *gocv.VideoCapture, 1)
+
+		go func() {
+			wc, err := gocv.OpenVideoCaptureWithAPI(deviceID, 1900)
+			if err != nil {
+				fmt.Printf("Error opening video stream device: %v\n", deviceID)
+                wg.Done()
+				return
+			}
+			c1 <- wc
+		}()
+
+		select {
+		case webcam = <-c1:
+			fmt.Printf("connection to %s succesful", deviceID)
+        case <-ctxTimeout.Done():
+            wg.Done()
+			fmt.Printf("connetion to %s timeouted", deviceID)
+            return
 		}
+
 		defer webcam.Close()
 	}
 

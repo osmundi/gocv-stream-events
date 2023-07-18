@@ -1,7 +1,15 @@
 # gocv-stream-events
 
 
-### Run in docker:
+### Dependencies
+
+[gocv (opencv >4.7.0)](https://pkg.go.dev/gocv.io/x/gocv#readme-installation)
+
+### Prerequisites
+
+A [YOLO](https://pjreddie.com/darknet/yolo/) model is needed 
+
+### Build
 ```
 docker build -t detector:latest .
 ```
@@ -23,6 +31,7 @@ touch container.log
 mkdir dbdata
 ```
 
+### Run
 
 ```
 docker-compose up -d
