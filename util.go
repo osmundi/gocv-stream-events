@@ -17,7 +17,7 @@ func logConfigurations(configs map[string]string) {
 
 func readClasses() []string {
 	var classes []string
-	file, err := os.Open("./coco.names.default")
+	file, err := os.Open("./models/coco.names.default")
 	if err != nil {
 		log.Fatal(err)
 	}
