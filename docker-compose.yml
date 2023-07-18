@@ -4,7 +4,7 @@ services:
     build: .
     image: detector:latest
     env_file:
-      - prod.env
+      - docker.env
     working_dir: /go/src
     volumes:
       - ./container.log:/go/src/container.log
@@ -19,11 +19,7 @@ services:
     command:
       [
         "/go/bin/app",
-        "--",
-        "yolo-obj_final.weights",
-        "yolo-obj.cfg",
-        "opencv",
-        "75",
+        "-h",
       ]
   db:
     image: postgres:latest
